@@ -2,9 +2,7 @@ import os
 import re
 import json
 import datetime
-from io import BytesIO
 import requests
-import pdfplumber
 from dateutil import tz
 from playwright.sync_api import sync_playwright
 
@@ -23,27 +21,16 @@ HEADERS = {
 
 VILNIUS = tz.gettz("Europe/Vilnius")
 
-LIDL_LEAFLETS_URL = "https://www.lidl.lt/c/kainu-leidiniai/s10020254"
+LIDL_URL = "https://www.lidl.lt/c/kainu-leidiniai/s10020254"
 
 def now_vilnius():
     return datetime.datetime.now(tz=VILNIUS)
 
-def iso_week_id(d=None):
-    d = d or now_vilnius()
-    # ISO week id: YYYY-Www
-    year, week, _ = d.isocalendar()
-    return f"{year}-W{week:02d}"
-
 def should_run(now: datetime.datetime) -> bool:
-    # Run only Mon/Thu/Sat at 12:00-12:15 local time
-    allowed_weekdays = {0, 3, 5}  # Mon, Thu, Sat
-    if now.weekday() not in allowed_weekdays:
-        return False
-    if now.hour != 12:
-        return False
-    return 0 <= now.minute <= 15
+    # Mon/Thu/Sat 12:00-12:15 Europe/Vilnius
+    allowed_weekdays = {0, 3, 5}
+    return (now.weekday() in allowed_weekdays) and (now.hour == 12) and (0 <= now.minute <= 15)
 
-# --- Supabase REST helpers ---
 def supa_get(path, params=None):
     url = f"{SUPABASE_URL}/rest/v1/{path}"
     r = requests.get(url, headers=HEADERS, params=params, timeout=60)
@@ -55,13 +42,10 @@ def supa_patch(path, where_params: dict, patch: dict):
     r = requests.patch(url, headers=HEADERS, params=where_params, data=json.dumps(patch), timeout=60)
     r.raise_for_status()
 
-def supa_insert_offers(rows: list[dict]):
+def supa_insert_offers(rows):
     if not rows:
         return
-    # Upsert using the unique index columns (must match on_conflict columns)
-    # offers_dedupe_uq: (week_id, store, title, coalesce(pack_value,-1), coalesce(pack_unit,''), price)
-    # PostgREST on_conflict must use real columns; pack_value/pack_unit may be null,
-    # still works for most cases; scraper also dedupes in Python.
+    # upsert by a reasonable conflict set
     url = f"{SUPABASE_URL}/rest/v1/offers?on_conflict=week_id,store,title,pack_value,pack_unit,price"
     headers = dict(HEADERS)
     headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
@@ -82,113 +66,20 @@ def update_job(job_id: str, patch: dict):
 def update_run(run_id: str, patch: dict):
     supa_patch("runs", {"id": f"eq.{run_id}"}, patch)
 
-# --- Lidl collector ---
-def find_lidl_pdf_links() -> list[str]:
-    """
-    Use Playwright to render the leaflets page and collect all unique PDF URLs.
-    """
-    pdfs = set()
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-        page.goto(LIDL_LEAFLETS_URL, wait_until="networkidle", timeout=60000)
-        page.wait_for_timeout(2000)
+# -------- Lidl HTML extraction --------
 
-        # Collect all hrefs that look like pdf
-        anchors = page.locator("a").all()
-        for a in anchors:
-            href = a.get_attribute("href")
-            if not href:
-                continue
-            if ".pdf" in href.lower():
-                # Normalize relative links
-                if href.startswith("/"):
-                    href = "https://www.lidl.lt" + href
-                pdfs.add(href)
+PRICE_RE = re.compile(r"(?<!\d)(\d{1,3}(?:[.,]\d{2}))\s*€")
+PACK_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*(kg|g|l|ml|vnt)\b", re.IGNORECASE)
 
-        browser.close()
-
-    return sorted(pdfs)
-
-_price_re = re.compile(r"(?<!\d)(\d{1,3}(?:[.,]\d{2}))\s*€")
-_pack_re = re.compile(r"(\d+(?:[.,]\d+)?)\s*(kg|g|l|ml|vnt)\b", re.IGNORECASE)
-
-def parse_pdf_offers(pdf_bytes: bytes, source_url: str, week_id: str) -> list[dict]:
-    """
-    Generic PDF text extraction:
-    - Extract lines from PDF
-    - Identify lines containing prices
-    - Build a minimal offer record: title + price (+ pack if detected)
-    This is MVP. Lidl PDF layout varies; later we’ll refine extraction rules.
-    """
-    offers = []
-    seen = set()
-
-    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text() or ""
-            lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
-
-            for ln in lines:
-                m_price = _price_re.search(ln)
-                if not m_price:
-                    continue
-
-                price_str = m_price.group(1).replace(",", ".")
-                try:
-                    price = float(price_str)
-                except:
-                    continue
-
-                # Title heuristic: remove price token, keep remaining text
-                title = _price_re.sub("", ln).strip(" -–•|")
-                title = re.sub(r"\s{2,}", " ", title).strip()
-                if len(title) < 3:
-                    continue
-
-                pack_value = None
-                pack_unit = None
-                m_pack = _pack_re.search(ln)
-                if m_pack:
-                    pv = m_pack.group(1).replace(",", ".")
-                    try:
-                        pack_value = float(pv)
-                        pack_unit = m_pack.group(2).lower()
-                    except:
-                        pack_value = None
-                        pack_unit = None
-
-                unit_price = None
-                unit_price_unit = None
-                if pack_value and pack_unit:
-                    unit_price, unit_price_unit = compute_unit_price(price, pack_value, pack_unit)
-
-                # Dedup key (local)
-                key = (title.lower(), price, pack_value, pack_unit)
-                if key in seen:
-                    continue
-                seen.add(key)
-
-                offers.append({
-                    "week_id": week_id,
-                    "store": "lidl",
-                    "title": title,
-                    "category": None,
-                    "price": round(price, 2),
-                    "old_price": None,
-                    "currency": "EUR",
-                    "pack_value": pack_value,
-                    "pack_unit": pack_unit,
-                    "unit_price": unit_price,
-                    "unit_price_unit": unit_price_unit,
-                    "discount_pct": None,
-                    "valid_from": None,
-                    "valid_to": None,
-                    "source_url": source_url,
-                    "source_type": "pdf",
-                })
-
-    return offers
+def normalize_price(s: str):
+    s = s.replace(" ", "").replace("\xa0", "")
+    m = PRICE_RE.search(s)
+    if not m:
+        return None
+    try:
+        return float(m.group(1).replace(",", "."))
+    except:
+        return None
 
 def compute_unit_price(price: float, pack_value: float, pack_unit: str):
     pack_unit = pack_unit.lower()
@@ -211,16 +102,115 @@ def compute_unit_price(price: float, pack_value: float, pack_unit: str):
             return round(price / pack_value, 4), "EUR/vnt"
     return None, None
 
-def download(url: str) -> bytes:
-    r = requests.get(url, timeout=120)
-    r.raise_for_status()
-    return r.content
+def extract_lidl_offers_html(week_id: str):
+    """
+    MVP strategy:
+    - Render Lidl page
+    - Grab visible text blocks
+    - Identify product-like chunks containing €
+    - Heuristically extract title + price (+ pack if present)
+    This works even when DOM structure changes, because it uses text heuristics.
+    """
+    offers = []
+    seen = set()
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+
+        page.goto(LIDL_URL, wait_until="networkidle", timeout=60000)
+        page.wait_for_timeout(2500)
+
+        # Scroll to force lazy content
+        for _ in range(8):
+            page.mouse.wheel(0, 1200)
+            page.wait_for_timeout(600)
+
+        # Collect candidate text blocks from the page
+        # We take div/li/section articles; if Lidl changes DOM, text approach still catches.
+        candidates = page.locator("div, li, section, article").all()
+        texts = []
+        for el in candidates:
+            try:
+                t = el.inner_text(timeout=1000)
+                if t and "€" in t:
+                    t = re.sub(r"\s+\n", "\n", t)
+                    t = re.sub(r"\n{3,}", "\n\n", t)
+                    texts.append(t.strip())
+            except:
+                continue
+
+        browser.close()
+
+    # Flatten and parse
+    for block in texts:
+        # Take lines and attempt to form product entries
+        lines = [ln.strip() for ln in block.split("\n") if ln.strip()]
+        # We look for lines that contain €; title usually is same line or previous line
+        for i, ln in enumerate(lines):
+            if "€" not in ln:
+                continue
+            price = normalize_price(ln)
+            if price is None:
+                continue
+
+            title = None
+            # Prefer previous line as title if it looks like a name
+            if i > 0 and len(lines[i-1]) >= 3 and "€" not in lines[i-1]:
+                title = lines[i-1]
+            else:
+                # fallback: remove price token from same line
+                title = PRICE_RE.sub("", ln).strip(" -–•|")
+            title = re.sub(r"\s{2,}", " ", (title or "")).strip()
+            if len(title) < 3:
+                continue
+
+            pack_value = None
+            pack_unit = None
+            m_pack = PACK_RE.search(" ".join(lines[max(0, i-2): i+2]))
+            if m_pack:
+                try:
+                    pack_value = float(m_pack.group(1).replace(",", "."))
+                    pack_unit = m_pack.group(2).lower()
+                except:
+                    pack_value = None
+                    pack_unit = None
+
+            unit_price = None
+            unit_price_unit = None
+            if pack_value and pack_unit:
+                unit_price, unit_price_unit = compute_unit_price(price, pack_value, pack_unit)
+
+            key = (title.lower(), price, pack_value, pack_unit)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            offers.append({
+                "week_id": week_id,
+                "store": "lidl",
+                "title": title,
+                "category": None,
+                "price": round(price, 2),
+                "old_price": None,
+                "currency": "EUR",
+                "pack_value": pack_value,
+                "pack_unit": pack_unit,
+                "unit_price": unit_price,
+                "unit_price_unit": unit_price_unit,
+                "discount_pct": None,
+                "valid_from": None,
+                "valid_to": None,
+                "source_url": LIDL_URL,
+                "source_type": "html",
+            })
+
+    return offers
 
 def main():
     now = now_vilnius()
     print(f"[worker] Now (Vilnius): {now.isoformat()}")
 
-    # If manually triggered, allow run regardless of time window:
     event_name = os.getenv("GITHUB_EVENT_NAME", "")
     manual = (event_name == "workflow_dispatch")
 
@@ -235,42 +225,26 @@ def main():
 
     job_id = job["id"]
     run_id = job["run_id"]
-    week_id = job.get("week_id") or iso_week_id()
+    week_id = job.get("week_id") or f"{now.isocalendar().year}-W{now.isocalendar().week:02d}"
     print(f"[worker] Picked job_id={job_id}, run_id={run_id}, week_id={week_id}")
 
     try:
         update_job(job_id, {"status": "running", "started_at": now.isoformat()})
 
-        # ---- LIDL ONLY (Stage 1) ----
-        pdf_links = find_lidl_pdf_links()
-        print(f"[lidl] Found PDF links: {len(pdf_links)}")
+        offers = extract_lidl_offers_html(week_id=week_id)
+        print(f"[lidl-html] Extracted offers: {len(offers)}")
 
-        all_offers = []
-        for pdf_url in pdf_links:
-            try:
-                pdf_bytes = download(pdf_url)
-                offers = parse_pdf_offers(pdf_bytes, source_url=pdf_url, week_id=week_id)
-                print(f"[lidl] {pdf_url} -> offers extracted: {len(offers)}")
-                all_offers.extend(offers)
-            except Exception as e:
-                print(f"[lidl] PDF parse failed: {pdf_url} :: {e}")
-
-        # Insert into offers
-        supa_insert_offers(all_offers)
+        supa_insert_offers(offers)
 
         finished = now_vilnius()
-        stores_ok = 1
-        offers_count = len(all_offers)
-
         update_run(run_id, {
             "status": "ok",
-            "stores_ok": stores_ok,
-            "offers_count": offers_count,
+            "stores_ok": 1 if len(offers) > 0 else 0,
+            "offers_count": len(offers),
             "finished_at": finished.isoformat(),
             "errors": None,
-            "notes": f"Lidl stage completed. PDFs={len(pdf_links)} offers={offers_count}"
+            "notes": f"Lidl HTML stage completed. offers={len(offers)}"
         })
-
         update_job(job_id, {"status": "done", "finished_at": finished.isoformat(), "error": None})
         print("[worker] Completed successfully.")
 
@@ -283,7 +257,7 @@ def main():
             "status": "fail",
             "finished_at": finished.isoformat(),
             "errors": {"worker": err},
-            "notes": "Worker failed in Lidl stage."
+            "notes": "Worker failed in Lidl HTML stage."
         })
         update_job(job_id, {"status": "failed", "finished_at": finished.isoformat(), "error": err})
         raise
