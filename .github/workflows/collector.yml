@@ -32,3 +32,9 @@ jobs:
           TZ: Europe/Vilnius
         run: |
           python scrape.py
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
